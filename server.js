@@ -1,6 +1,6 @@
 // Sales Bot Dashboard — сервер
-// Каждые N минут опрашивает API Salebot (get subscribers), сохраняет новых
-// клиентов в SQLite и отдаёт дашборду посчитанную статистику.
+// Каждые N минут опрашивает API Salebot (get_clients), сохраняет клиентов
+// в SQLite и отдаёт дашборду посчитанную статистику.
 
 const express = require('express');
 const path = require('path');
@@ -9,12 +9,15 @@ require('dotenv').config();
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.SALEBOT_API_KEY;
-const GROUP_ID = process.env.SALEBOT_GROUP_ID || ''; // id бота внутри проекта Salebot (необязательно)
+// SALEBOT_GROUP_ID — это значение поля "group" в ответе Salebot (например "soulful_trader_bot"),
+// а НЕ числовой ID. Посмотреть его можно, открыв в браузере:
+// https://chatter.salebot.pro/api/ТВОЙ_КЛЮЧ/get_clients?offset=0&limit=1
+const GROUP_ID = process.env.SALEBOT_GROUP_ID || '';
 const POLL_INTERVAL_MINUTES = parseFloat(process.env.POLL_INTERVAL_MINUTES || '5');
 const BASE_URL = process.env.SALEBOT_BASE_URL || 'https://chatter.salebot.pro';
 
 if (!API_KEY) {
-  console.error('ОШИБКА: не задан SALEBOT_API_KEY в переменных окружения (.env). Без него опрос Salebot невозможен.');
+  console.error('ОШИБКА: не задан SALEBOT_API_KEY в переменных окружения. Без него опрос Salebot невозможен.');
 }
 
 const app = express();
@@ -37,35 +40,38 @@ const upsertStmt = db.prepare(`
 
 // ---------- ОПРОС SALEBOT ----------
 
-function formatSqlDate(unixSeconds) {
-  const d = unixSeconds ? new Date(unixSeconds * 1000) : new Date();
-  return d.toISOString().slice(0, 19).replace('T', ' ');
+// Salebot отдаёт created_at уже готовой строкой вида "2026-09-09 10:25:47.198713".
+// SQLite понимает формат "YYYY-MM-DD HH:MM:SS", поэтому просто обрезаем до секунд.
+function toSqlDate(rawCreatedAt) {
+  if (rawCreatedAt && typeof rawCreatedAt === 'string' && rawCreatedAt.length >= 19) {
+    return rawCreatedAt.slice(0, 19);
+  }
+  return new Date().toISOString().slice(0, 19).replace('T', ' ');
 }
 
-// Забирает всех подписчиков бота постранично.
-// Salebot отдаёт список без явного признака "это последняя страница" — эвристика:
-// если пришло меньше 100 записей, считаем страницу последней.
-async function fetchAllSubscribers() {
+// Забирает всех клиентов постранично через get_clients (offset/limit).
+async function fetchAllClients() {
   const results = [];
-  let page = 1;
-  const MAX_PAGES = 300; // защита от бесконечного цикла
+  let offset = 0;
+  const limit = 100;
+  const MAX_ITER = 500; // защита от бесконечного цикла
 
-  while (page <= MAX_PAGES) {
-    const url = new URL(`${BASE_URL}/api/${API_KEY}/subscribers`);
-    if (GROUP_ID) url.searchParams.set('group', GROUP_ID);
-    url.searchParams.set('page', String(page));
+  for (let i = 0; i < MAX_ITER; i++) {
+    const url = new URL(`${BASE_URL}/api/${API_KEY}/get_clients`);
+    url.searchParams.set('offset', String(offset));
+    url.searchParams.set('limit', String(limit));
 
     const res = await fetch(url);
     if (!res.ok) {
       throw new Error(`Salebot API ответил ${res.status}: ${await res.text()}`);
     }
     const data = await res.json();
-    const items = Array.isArray(data) ? data : (data.result || data.clients || []);
+    const items = Array.isArray(data) ? data : (data.clients || data.result || []);
 
     if (!items.length) break;
     results.push(...items);
-    if (items.length < 100) break;
-    page++;
+    if (items.length < limit) break;
+    offset += limit;
   }
   return results;
 }
@@ -73,7 +79,9 @@ async function fetchAllSubscribers() {
 async function pollAndStore() {
   if (!API_KEY) return;
   try {
-    const subs = await fetchAllSubscribers();
+    const clients = await fetchAllClients();
+    const filtered = GROUP_ID ? clients.filter((c) => String(c.group) === String(GROUP_ID)) : clients;
+
     const insertMany = db.transaction((items) => {
       for (const c of items) {
         const id = c.id ?? c.client_id;
@@ -81,12 +89,15 @@ async function pollAndStore() {
         upsertStmt.run({
           client_id: String(id),
           name: c.name || null,
-          created_at: formatSqlDate(c.created_at),
+          created_at: toSqlDate(c.created_at),
         });
       }
     });
-    insertMany(subs);
-    console.log(`[${new Date().toLocaleTimeString('ru-RU')}] опрос Salebot: получено ${subs.length} записей`);
+    insertMany(filtered);
+    console.log(
+      `[${new Date().toLocaleTimeString('ru-RU')}] опрос Salebot: получено ${clients.length} клиентов` +
+      (GROUP_ID ? `, после фильтра по group="${GROUP_ID}": ${filtered.length}` : '')
+    );
   } catch (e) {
     console.error(`[${new Date().toLocaleTimeString('ru-RU')}] ошибка опроса Salebot:`, e.message);
   }
